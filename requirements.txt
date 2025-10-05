@@ -1,4 +1,4 @@
-# requirements.txt  — 불필요 의존성 제거
+# requirements.txt
 streamlit==1.38.0
 yfinance==0.2.43
 plotly==5.24.1

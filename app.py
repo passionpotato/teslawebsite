@@ -1,9 +1,10 @@
-# app.py — Tesla One-Stop (FREE) + X 임베드/폴링
+# app.py — Tesla One-Stop (FREE) + YouTube 라이브/최신 영상
+import os
 import time
 import re
 from datetime import datetime
 from typing import List, Dict, Optional
-import os
+from urllib.parse import urlparse, parse_qs
 
 import pandas as pd
 import requests
@@ -11,22 +12,18 @@ import yfinance as yf
 import feedparser
 import plotly.graph_objects as go
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 from xml.etree import ElementTree as ET
 
-# ---------------------------
-# Streamlit Config
-# ---------------------------
 st.set_page_config(page_title="Tesla One-Stop (Free)", page_icon="🚗", layout="wide")
 
 # ---------------------------
-# Constants & Settings
+# 공통 설정/상수
 # ---------------------------
 TSLA = "TSLA"
-CUSIP_TSLA_PREFIX = "88160R"  # TSLA CUSIP prefix
-INTRADAY = {"1m", "2m", "5m", "15m", "30m", "60m", "90m"}
+CUSIP_TSLA_PREFIX = "88160R"
+INTRADAY = {"1m","2m","5m","15m","30m","60m","90m"}
 
-# 기본 추적 기관(CIK)
+# 기본 기관 CIK (13F)
 DEFAULT_CIKS = {
     "BlackRock Inc.": "0001364742",
     "The Vanguard Group, Inc.": "0000102909",
@@ -36,6 +33,7 @@ DEFAULT_CIKS = {
     "T. Rowe Price Associates, Inc.": "0000080255",
 }
 
+# 뉴스 RSS
 RSS_SOURCES = {
     "Tesla IR (Press)": "https://ir.tesla.com/press-releases/rss",
     "Electrek – Tesla": "https://electrek.co/guides/tesla/feed/",
@@ -44,82 +42,130 @@ RSS_SOURCES = {
     "Google News – Tesla": "https://news.google.com/rss/search?q=Tesla%20OR%20TSLA&hl=en-US&gl=US&ceid=US:en",
 }
 
-# X(트위터) 핸들/ID
+# X(트위터) 계정
 X_USERNAMES = {
     "Elon Musk": "elonmusk",
     "Donald Trump": "realDonaldTrump",
     "Tesla": "Tesla",
 }
-# API 호출 수 절감용: 잘 알려진 고정 user_id 하드코딩(없으면 자동 조회)
-X_USER_IDS = {
+X_USER_IDS = {  # 호출 절약용 하드코딩
     "elonmusk": "44196397",
     "realDonaldTrump": "25073877",
     "Tesla": "13298072",
 }
 
-# ---- SEC base (무료 13F) ----
-SEC_BASE = "https://data.sec.gov"
-# ⚠️ 꼭 본인 이메일로 교체하세요(SEC 권장)
-SEC_UA = {"User-Agent": "TeslaDash/1.0 (your-email@example.com)"}
+# 유튜브 채널 (채널ID는 UI에서 수정 가능; 여기 기본 예시/자리표시)
+DEFAULT_YT_CHANNELS = [
+    {"채널명": "오늘의 테슬라 뉴스", "channel_id": "UCXq7NNALDnqafn3KFvIyJKA"},
+    {"채널명": "마피디 미국주식", "channel_id": "UCjp7GHSUKx9Joji3tIz1jCg"},
+    {"채널명": "엔지니어TV", "channel_id": "UCnvCYORRLMYMQNhrlBILdCg"},
+    {"채널명": "올랜도 킴 미국주식", "channel_id": "UCwSSqi-s0wcH6pJbH3YPZqQ"},
+]
 
-# X API (선택)
+# SEC
+SEC_BASE = "https://data.sec.gov"
+SEC_UA = {"User-Agent": "TeslaDash/1.0 (your-email@example.com)"}  # 본인 이메일로 교체 권장
+
+# 안전한 시크릿 접근 (secrets.toml 없을 때도 안전)
 def get_secret(key: str, default: str = "") -> str:
     try:
-        return st.secrets.get(key, default)  # secrets.toml이 없으면 예외가 날 수 있음
+        return st.secrets.get(key, default)
     except Exception:
         return os.getenv(key, default) or default
 
-X_BEARER = get_secret("X_BEARER_TOKEN", "")  # ⬅️ 기존 st.secrets.get(...) 대신 이걸 사용
+X_BEARER = get_secret("X_BEARER_TOKEN", "")
+YOUTUBE_API_KEY = get_secret("YOUTUBE_API_KEY", "")
 
 # ---------------------------
-# Utils — Price (Yahoo + Stooq fallback)
+# 페이지 자동 새로고침(JS, 추가 의존성 無)
+# ---------------------------
+def auto_refresh_html(seconds: int, key: str):
+    ms = int(seconds * 1000)
+    st.components.v1.html(
+        f"""
+        <script>
+        (function(){{
+            const KEY="{key}";
+            if(!window.__autoRefreshTimers) window.__autoRefreshTimers = {{}};
+            if(!window.__autoRefreshTimers[KEY]) {{
+                window.__autoRefreshTimers[KEY] = setTimeout(function(){{
+                    const url = new URL(window.location.href);
+                    url.searchParams.set(KEY, Date.now().toString());
+                    window.location.href = url.toString();
+                }}, {ms});
+            }}
+        }})();
+        </script>
+        """, height=0
+    )
+
+# ---------------------------
+# 가격/차트 (Yahoo + Stooq fallback)
 # ---------------------------
 @st.cache_data(ttl=120)
 def safe_yf_download(symbol: str, period: str, interval: str):
     """
-    야후 규칙에 맞게 period/interval 자동 보정 + 세션 UA 주입 + 재시도 + Stooq 일봉 백업
-    반환: (df, (used_period, used_interval), note|None)
+    강인한 가격 수집:
+    1) yfinance.Ticker().history (권장)
+    2) yfinance.download (threads=False)
+    3) interval/period 자동 보정
+    4) Stooq 일봉 최종 백업
     """
+    import requests, pandas as pd, yfinance as yf
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0"})
-    combos = [(period, interval)]
 
-    # 보정 후보 추가
-    if interval == "1m" and period not in {"1d", "5d", "7d"}:
-        combos.append(("5d", "1m"))
-    if interval in INTRADAY and period not in {"1d", "5d", "7d", "1mo", "3mo", "6mo", "60d", "90d"}:
-        combos.append(("1mo", "5m"))
-    combos.append(("1y", "1d"))  # 최후의 야후 데일리 요청
+    # 🔧 간격 보정: 일부 환경에서 '1h' 대신 '60m'가 안정적
+    interval_fixed = {"1h": "60m"}.get(interval, interval)
+
+    # 요청 후보(우선순위)
+    combos = [(period, interval_fixed)]
+    if interval_fixed == "1m" and period not in {"1d","5d","7d"}:
+        combos.append(("5d","1m"))
+    if interval_fixed in INTRADAY and period not in {"1d","5d","7d","1mo","3mo","6mo","60d","90d"}:
+        combos.append(("1mo","5m"))
+    combos.append(("1y","1d"))  # 최후의 야후 데일리
 
     last_err = None
+
+    # 1) Ticker().history (가장 안정)
+    try:
+        tkr = yf.Ticker(symbol, session=session)
+        df = tkr.history(period=period, interval=interval_fixed, prepost=False, auto_adjust=False)
+        if not df.empty:
+            return df, (period, interval_fixed), "yfinance.history"
+    except Exception as e:
+        last_err = f"history: {e}"
+
+    # 2) download 재시도 (threads=False가 오류 줄임)
     for p, i in combos:
         try:
             df = yf.download(
                 symbol, period=p, interval=i,
-                auto_adjust=False, prepost=False, progress=False, session=session
+                auto_adjust=False, prepost=False,
+                progress=False, threads=False, session=session
             )
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = [c[0] for c in df.columns]
             if not df.empty:
-                return df, (p, i), None
+                return df, (p, i), "yfinance.download"
         except Exception as e:
-            last_err = str(e)
+            last_err = f"download {p}/{i}: {e}"
 
-    # Yahoo 실패 시 Stooq 일봉 백업
+    # 3) Stooq 일봉 백업
     try:
+        import pandas as pd
         stooq = pd.read_csv("https://stooq.com/q/d/l/?s=tsla.us&i=d")
-        stooq.rename(columns={
-            "Date": "Datetime",
-            "Open": "Open", "High": "High", "Low": "Low", "Close": "Close", "Volume": "Volume"
-        }, inplace=True)
+        stooq.rename(columns={"Date":"Datetime"}, inplace=True)
         stooq["Datetime"] = pd.to_datetime(stooq["Datetime"])
         stooq.set_index("Datetime", inplace=True)
         stooq = stooq.dropna()
         if not stooq.empty:
-            return stooq, ("stooq-daily", "1d"), "Yahoo empty → Stooq daily fallback"
+            return stooq, ("stooq-daily","1d"), "Yahoo empty → Stooq daily fallback"
     except Exception as e:
-        last_err = f"Yahoo+Stooq failed: {e}"
+        last_err = f"Stooq: {e}"
 
+    # 모두 실패
     return pd.DataFrame(), None, last_err
 
 def plot_candles(df: pd.DataFrame, title: str):
@@ -132,8 +178,8 @@ def plot_candles(df: pd.DataFrame, title: str):
     if "Volume" in df.columns:
         fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", yaxis="y2", opacity=0.3))
         fig.update_layout(
-            yaxis=dict(domain=[0.3, 1.0], title="Price"),
-            yaxis2=dict(domain=[0.0, 0.25], title="Volume"),
+            yaxis=dict(domain=[0.3,1.0], title="Price"),
+            yaxis2=dict(domain=[0.0,0.25], title="Volume"),
             xaxis=dict(title="Time"),
             title=title, height=600, margin=dict(l=10, r=10, t=40, b=10)
         )
@@ -142,7 +188,7 @@ def plot_candles(df: pd.DataFrame, title: str):
     st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------
-# Utils — RSS
+# 뉴스 RSS
 # ---------------------------
 @st.cache_data(ttl=300)
 def fetch_rss(feed_url: str, limit: int = 12) -> List[Dict]:
@@ -153,21 +199,19 @@ def fetch_rss(feed_url: str, limit: int = 12) -> List[Dict]:
             "title": e.get("title"),
             "link": e.get("link"),
             "published": e.get("published", ""),
-            "summary": re.sub("<.*?>", "", e.get("summary", "")) if e.get("summary") else "",
+            "summary": re.sub("<.*?>","", e.get("summary","")) if e.get("summary") else "",
         })
     return items
 
 # ---------------------------
-# Utils — SEC 13F (무료)
+# SEC 13F (무료)
 # ---------------------------
 def _strip_xml_ns(xml_text: str) -> str:
-    # 네임스페이스 제거 (파싱 호환성↑)
-    xml_text = re.sub(r'\sxmlns(:\w+)?="[^"]+"', '', xml_text)
-    return xml_text
+    return re.sub(r'\sxmlns(:\w+)?="[^"]+"','', xml_text)
 
 def _to_int(x):
     try:
-        return int(str(x).replace(",", "").strip())
+        return int(str(x).replace(",","").strip())
     except Exception:
         return None
 
@@ -179,88 +223,76 @@ def sec_recent_filings(cik: str) -> pd.DataFrame:
     r.raise_for_status()
     js = r.json()
     rec = js.get("filings", {}).get("recent", {})
-    df = pd.DataFrame(rec)
-    return df
+    return pd.DataFrame(rec)
 
 def _acc_nodash(acc: str) -> str:
-    return acc.replace("-", "")
+    return acc.replace("-","")
 
 @st.cache_data(ttl=3600)
 def sec_list_13f_accessions(cik: str, limit=3) -> List[Dict]:
     df = sec_recent_filings(cik)
-    if df.empty:
-        return []
-    mask = df["form"].isin(["13F-HR", "13F-HR/A"])
+    if df.empty: return []
+    mask = df["form"].isin(["13F-HR","13F-HR/A"])
     sdf = df[mask].head(limit)
     rows = []
     for _, r in sdf.iterrows():
         rows.append({
             "cik": cik,
             "accession": r["accessionNumber"],
-            "reportDate": r.get("reportDate", ""),
-            "primaryDocument": r.get("primaryDocument", ""),
+            "reportDate": r.get("reportDate",""),
+            "primaryDocument": r.get("primaryDocument",""),
         })
     return rows
 
 @st.cache_data(ttl=3600)
 def sec_find_infotable_url(cik: str, accession: str) -> Optional[str]:
-    cik_nozero = str(int(cik))
-    acc_nodash = _acc_nodash(accession)
-    idx = f"https://www.sec.gov/Archives/edgar/data/{cik_nozero}/{acc_nodash}/index.json"
+    cik_nozero = str(int(cik)); acc = _acc_nodash(accession)
+    idx = f"https://www.sec.gov/Archives/edgar/data/{cik_nozero}/{acc}/index.json"
     r = requests.get(idx, headers=SEC_UA, timeout=20)
-    if not r.ok:
-        return None
-    files = r.json().get("directory", {}).get("item", [])
-    # XML 우선
+    if not r.ok: return None
+    files = r.json().get("directory",{}).get("item",[])
     for f in files:
-        name = f.get("name", "").lower()
+        name = f.get("name","").lower()
         if name.endswith(".xml") and ("infotable" in name or "informationtable" in name or "form13f" in name):
-            return f"https://www.sec.gov/Archives/edgar/data/{cik_nozero}/{acc_nodash}/{f['name']}"
-    # TXT 백업 (XML이 txt 내부에 포함된 케이스)
+            return f"https://www.sec.gov/Archives/edgar/data/{cik_nozero}/{acc}/{f['name']}"
     for f in files:
-        name = f.get("name", "").lower()
+        name = f.get("name","").lower()
         if name.endswith(".txt"):
-            return f"https://www.sec.gov/Archives/edgar/data/{cik_nozero}/{acc_nodash}/{f['name']}"
+            return f"https://www.sec.gov/Archives/edgar/data/{cik_nozero}/{acc}/{f['name']}"
     return None
 
 def _parse_infotable_xml(xml_text: str) -> pd.DataFrame:
-    # TXT 안의 <informationTable>만 추출
     m = re.search(r"<informationTable[\s\S]*</informationTable>", xml_text, re.IGNORECASE)
-    if m:
-        xml_text = m.group(0)
+    if m: xml_text = m.group(0)
     xml_text = _strip_xml_ns(xml_text)
     root = ET.fromstring(xml_text.encode("utf-8"))
     rows = []
     for it in root.iterfind(".//infoTable"):
-        issuer = (it.findtext("nameOfIssuer", default="") or "").strip()
-        cusip = (it.findtext("cusip", default="") or "").strip()
-        # shares
+        issuer = (it.findtext("nameOfIssuer","") or "").strip()
+        cusip = (it.findtext("cusip","") or "").strip()
         amt = it.find(".//shrsOrPrnAmt/sshPrnamt")
-        shares = _to_int(amt.text) if amt is not None and amt.text else None
-        # value (thousands USD)
+        shares = _to_int(amt.text) if (amt is not None and amt.text) else None
         val = _to_int(it.findtext("value"))
-        value_usd = val * 1000 if val is not None else None
-        rows.append({"issuer": issuer, "cusip": cusip, "shares": shares, "value_usd": value_usd})
+        value_usd = val*1000 if val is not None else None
+        rows.append({"issuer":issuer,"cusip":cusip,"shares":shares,"value_usd":value_usd})
     return pd.DataFrame(rows)
 
 @st.cache_data(ttl=3600)
 def sec_tsla_position_from_13f(cik: str, accession: str) -> Optional[Dict]:
     url = sec_find_infotable_url(cik, accession)
-    if not url:
-        return None
+    if not url: return None
     r = requests.get(url, headers=SEC_UA, timeout=30)
-    if not r.ok or not r.text:
-        return None
+    if not r.ok or not r.text: return None
     try:
         df = _parse_infotable_xml(r.text)
     except Exception:
         return None
     if df.empty:
-        return {"shares": 0, "value_usd": 0}
+        return {"shares":0, "value_usd":0}
     m = df[(df["cusip"].str.startswith(CUSIP_TSLA_PREFIX, na=False)) |
            (df["issuer"].str.contains("TESLA", case=False, na=False))]
     if m.empty:
-        return {"shares": 0, "value_usd": 0}
+        return {"shares":0, "value_usd":0}
     return {
         "shares": int(m["shares"].fillna(0).sum()),
         "value_usd": int(m["value_usd"].fillna(0).sum())
@@ -271,24 +303,20 @@ def build_13f_table(managers: Dict[str, str]) -> pd.DataFrame:
     for name, cik in managers.items():
         try:
             accs = sec_list_13f_accessions(cik, limit=2)
-            if not accs:
-                continue
-            latest = accs[0]
-            prev = accs[1] if len(accs) > 1 else None
+            if not accs: continue
+            latest = accs[0]; prev = accs[1] if len(accs)>1 else None
             latest_pos = sec_tsla_position_from_13f(cik, latest["accession"])
-            time.sleep(0.4)  # SEC 예의상
+            time.sleep(0.4)
             prev_pos = sec_tsla_position_from_13f(cik, prev["accession"]) if prev else None
-
             shares = latest_pos["shares"] if latest_pos else None
             value_usd = latest_pos["value_usd"] if latest_pos else None
             delta = None
             if latest_pos and prev_pos:
                 delta = (latest_pos["shares"] or 0) - (prev_pos["shares"] or 0)
-
             out.append({
                 "기관/펀드": name,
                 "CIK": cik,
-                "보고일(최근)": latest.get("reportDate", ""),
+                "보고일(최근)": latest.get("reportDate",""),
                 "보유주수(최근)": shares,
                 "평가액(USD, 최근)": value_usd,
                 "보유주수 증감(qoq)": delta
@@ -301,133 +329,212 @@ def build_13f_table(managers: Dict[str, str]) -> pd.DataFrame:
     return df
 
 # ---------------------------
-# Utils — X API (선택, 폴링)
+# X API (선택, 이미 사용 중인 구조 유지)
 # ---------------------------
 def _x_headers():
-    if not X_BEARER:
-        return None
+    if not X_BEARER: return None
     return {"Authorization": f"Bearer {X_BEARER}"}
 
 def _x_api_get(url, params=None, timeout=15):
-    """
-    api.x.com -> 실패 시 api.twitter.com도 시도(일부 환경 호환)
-    """
     h = _x_headers()
-    if not h:
-        return None
+    if not h: return None
     for base in ("https://api.x.com", "https://api.twitter.com"):
         try:
-            r = requests.get(base + url, headers=h, params=params, timeout=timeout)
-            if r.ok:
-                return r.json()
+            r = requests.get(base+url, headers=h, params=params, timeout=timeout)
+            if r.ok: return r.json()
         except Exception:
             pass
     return None
 
-@st.cache_data(ttl=24*3600)  # 하루 캐시
+@st.cache_data(ttl=24*3600)
 def x_get_user_id(username: str) -> Optional[str]:
-    # 하드코딩 우선 사용
-    if username in X_USER_IDS:
-        return X_USER_IDS[username]
+    if username in X_USER_IDS: return X_USER_IDS[username]
     js = _x_api_get(f"/2/users/by/username/{username}")
-    if not js:
-        return None
-    return js.get("data", {}).get("id")
+    if not js: return None
+    return js.get("data",{}).get("id")
 
-@st.cache_data(ttl=0)  # 폴링 주기마다 새 호출
-def x_fetch_latest_tweets(user_id: str, since_id: Optional[str] = None, max_results: int = 5):
-    params = {
-        "max_results": str(max_results),
-        "exclude": "retweets,replies",
-        "tweet.fields": "created_at,public_metrics,entities",
-    }
-    if since_id:
-        params["since_id"] = since_id
+@st.cache_data(ttl=0)
+def x_fetch_latest_tweets(user_id: str, since_id: Optional[str]=None, max_results: int=5):
+    params = {"max_results":str(max_results), "exclude":"retweets,replies",
+              "tweet.fields":"created_at,public_metrics,entities"}
+    if since_id: params["since_id"] = since_id
     js = _x_api_get(f"/2/users/{user_id}/tweets", params=params)
-    if not js:
-        return [], since_id
+    if not js: return [], since_id
     data = js.get("data", [])
     data.sort(key=lambda t: t.get("id"), reverse=False)
     new_since = data[-1]["id"] if data else since_id
     return data, new_since
 
 def _format_tweet_text(t):
-    txt = t.get("text", "")
+    txt = t.get("text","")
     ents = (t.get("entities") or {}).get("urls", []) or []
     for url in ents:
         u = url.get("url"); ex = url.get("expanded_url") or u
-        if u:
-            txt = txt.replace(u, ex)
+        if u: txt = txt.replace(u, ex)
     return txt
+
+# ---------------------------
+# YouTube (RSS + Data API v3)
+# ---------------------------
+@st.cache_data(ttl=300)
+def yt_rss_latest(channel_id: str, limit: int = 6):
+    """API 키 없이 최신 영상 리스트"""
+    feed = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+    parsed = feedparser.parse(feed)
+    items = []
+    for e in parsed.entries[:limit]:
+        vid = e.get("yt_videoid")
+        if not vid:
+            # 링크에서 v 파라미터 추출
+            try:
+                q = parse_qs(urlparse(e.get("link","")).query)
+                vid = q.get("v",[None])[0]
+            except Exception:
+                vid = None
+        items.append({
+            "video_id": vid,
+            "title": e.get("title",""),
+            "link": e.get("link",""),
+            "published": e.get("published",""),
+        })
+    return items
+
+@st.cache_data(ttl=60)
+def yt_api_live_videos(channel_id: str, max_results: int = 3):
+    """API 키가 있을 때 해당 채널의 라이브 중인 영상 검색"""
+    if not YOUTUBE_API_KEY:
+        return []
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {
+        "part": "snippet",
+        "channelId": channel_id,
+        "eventType": "live",
+        "type": "video",
+        "order": "date",
+        "maxResults": str(max_results),
+        "key": YOUTUBE_API_KEY,
+    }
+    r = requests.get(url, params=params, timeout=15)
+    if not r.ok:
+        return []
+    data = r.json().get("items", [])
+    out = []
+    for it in data:
+        vid = it.get("id",{}).get("videoId")
+        sn = it.get("snippet",{})
+        out.append({
+            "video_id": vid,
+            "title": sn.get("title","(live)"),
+            "published": sn.get("publishedAt",""),
+            "link": f"https://www.youtube.com/watch?v={vid}" if vid else "",
+        })
+    return out
+
+@st.cache_data(ttl=300)
+def yt_api_latest_videos(channel_id: str, max_results: int = 6):
+    """API 키가 있으면 검색 API로 최신 영상(업로드) 조회; 없으면 RSS를 쓰는 게 낫다."""
+    if not YOUTUBE_API_KEY:
+        return yt_rss_latest(channel_id, max_results)
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {
+        "part": "snippet",
+        "channelId": channel_id,
+        "type": "video",
+        "order": "date",
+        "maxResults": str(max_results),
+        "key": YOUTUBE_API_KEY,
+    }
+    r = requests.get(url, params=params, timeout=15)
+    if not r.ok:
+        return yt_rss_latest(channel_id, max_results)
+    data = r.json().get("items", [])
+    out = []
+    for it in data:
+        vid = it.get("id",{}).get("videoId")
+        sn = it.get("snippet",{})
+        out.append({
+            "video_id": vid,
+            "title": sn.get("title",""),
+            "published": sn.get("publishedAt",""),
+            "link": f"https://www.youtube.com/watch?v={vid}" if vid else "",
+        })
+    return out
+
+def yt_embed(video_id: str, height: int = 315):
+    if not video_id:
+        return
+    st.components.v1.html(
+        f"""
+        <div style="position:relative;padding-bottom:56.25%;height:0;overflow:hidden;">
+          <iframe src="https://www.youtube.com/embed/{video_id}"
+                  title="YouTube video" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                  allowfullscreen style="position:absolute;top:0;left:0;width:100%;height:100%;"></iframe>
+        </div>
+        """,
+        height=height+60
+    )
 
 # ---------------------------
 # UI
 # ---------------------------
 st.sidebar.title("Tesla One-Stop (Free)")
-page = st.sidebar.radio("메뉴", ["📈 차트", "📰 뉴스/코멘트", "🏦 지분 변동(13F, 무료)", "⚙️ 옵션/설정"])
+page = st.sidebar.radio(
+    "메뉴",
+    ["📈 차트", "📰 뉴스/코멘트", "📺 유튜브", "🏦 지분 변동(13F, 무료)", "⚙️ 옵션/설정"]
+)
 
-# ---- Chart ----
+# ---- 차트 ----
 if page == "📈 차트":
     st.title("📈 TSLA 차트 (안정화 버전)")
-    c1, c2, c3 = st.columns(3)
+    c1,c2,c3 = st.columns(3)
     with c1:
-        period = st.selectbox("기간", ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y"], index=0)
+        period = st.selectbox("기간", ["1d","5d","7d","1mo","3mo","6mo","1y"], index=0)
     with c2:
-        interval = st.selectbox("봉 간격", ["1m", "5m", "15m", "1h", "1d"], index=0)
+        interval = st.selectbox("봉 간격", ["1m","5m","15m","1h","1d"], index=0)
     with c3:
-        if st.button("캐시 초기화", help="yfinance가 빈 값을 캐시에 저장했을 때 유용"):
+        if st.button("캐시 초기화"):
             st.cache_data.clear()
             st.success("캐시 삭제 완료. 다시 불러오는 중…")
-
-    df, used, note = safe_yf_download(TSLA, period, interval)
-    if note:
-        st.info(note)
-    if used:
-        st.caption(f"실제 요청: period={used[0]}, interval={used[1]}")
-
+    df, used, note = safe_yf_download("TSLA", period, interval)
+    if note: st.caption(f"소스: {note}")
     if df.empty:
-        st.error("데이터를 불러오지 못했습니다. 네트워크/회사망 차단 여부를 확인하거나 다른 조합을 선택해 보세요.")
+        st.error("시세를 가져오지 못했어요.")
+        with st.expander("네트워크 진단"):
+            import requests
+            tests = [
+                "https://query2.finance.yahoo.com/v1/finance/trending/US?count=1",
+                "https://query2.finance.yahoo.com/v8/finance/chart/TSLA?range=1d&interval=1m",
+                "https://stooq.com/q/d/l/?s=tsla.us&i=d",
+            ]
+            for u in tests:
+                try:
+                    r = requests.get(u, headers={"User-Agent":"Mozilla/5.0"}, timeout=6)
+                    st.write(u, "→", r.status_code, f"{len(r.content)} bytes")
+                except Exception as e:
+                    st.write(u, "→", str(e))
     else:
         plot_candles(df, f"TSLA {used[0]}/{used[1]}")
-        if "Close" in df.columns and len(df) > 1:
-            last, prev = df["Close"].iloc[-1], df["Close"].iloc[-2]
-            st.metric("지연 현재가(소스 자동)", f"${last:,.2f}", f"{(last-prev):+.2f}")
-
-# ---- News & Comments ----
+# ---- 뉴스/X ----
 elif page == "📰 뉴스/코멘트":
     st.title("📰 뉴스 & 코멘트")
-    t1, t2, t3 = st.tabs(["뉴스 RSS", "유명인 코멘트 (임베드, 자동 새로고침)", "실시간 피드 (X API)"])
-
-    # RSS
+    t1,t2 = st.tabs(["뉴스 RSS","유명인 코멘트 (X 임베드 리프레시)"])
     with t1:
         cols = st.columns(2)
         keys = list(RSS_SOURCES.keys())
-        left_keys, right_keys = keys[: (len(keys)+1)//2], keys[(len(keys)+1)//2 :]
-        with cols[0]:
-            for k in left_keys:
-                st.subheader(k)
-                for it in fetch_rss(RSS_SOURCES[k], limit=7):
-                    st.markdown(f"- **[{it['title']}]({it['link']})**")
-                    if it["published"]:
-                        st.caption(it["published"])
-                st.markdown("---")
-        with cols[1]:
-            for k in right_keys:
-                st.subheader(k)
-                for it in fetch_rss(RSS_SOURCES[k], limit=7):
-                    st.markdown(f"- **[{it['title']}]({it['link']})**")
-                    if it["published"]:
-                        st.caption(it["published"])
-                st.markdown("---")
-
-    # X 임베드 + 자동 새로고침
+        left, right = keys[:(len(keys)+1)//2], keys[(len(keys)+1)//2:]
+        for col, group in zip(cols, [left, right]):
+            with col:
+                for k in group:
+                    st.subheader(k)
+                    for it in fetch_rss(RSS_SOURCES[k], limit=7):
+                        st.markdown(f"- **[{it['title']}]({it['link']})**")
+                        if it["published"]: st.caption(it["published"])
+                    st.markdown("---")
     with t2:
-        acct_label = st.selectbox("계정 선택", list(X_USERNAMES.keys()), key="embed_acct")
+        acct_label = st.selectbox("계정 선택", list(X_USERNAMES.keys()))
         handle = X_USERNAMES[acct_label]
-        col_l, col_r = st.columns([1,3])
-        with col_l:
-            refresh_sec = st.slider("새로고침(초)", 15, 180, 60, step=15, help="타임라인을 주기적으로 다시 로드합니다.")
-        st_autorefresh(interval=refresh_sec * 1000, key=f"x_refresh_{handle}")
+        refresh_sec = st.slider("새로고침(초)", 15, 180, 60, step=15)
+        auto_refresh_html(refresh_sec, key=f"x_refresh_{handle}")
         embed_html = f"""
         <a class="twitter-timeline" href="https://twitter.com/{handle}?ref_src=twsrc%5Etfw">
           Tweets by @{handle}
@@ -436,59 +543,93 @@ elif page == "📰 뉴스/코멘트":
         """
         st.components.v1.html(embed_html, height=800, scrolling=True)
 
-    # X API 폴링 (선택)
-    with t3:
-        st.caption("선택 기능: `.streamlit/secrets.toml`에 X_BEARER_TOKEN 설정 필요")
-        if not X_BEARER:
-            st.info("X_BEARER_TOKEN이 비어 있습니다. 시크릿에 토큰을 추가하세요.")
-        else:
-            acct_username = st.selectbox("계정 선택", list(X_USERNAMES.values()), key="api_acct")
-            # user_id: 하드코딩 우선, 없으면 API 조회
-            user_id = X_USER_IDS.get(acct_username) or x_get_user_id(acct_username)
-            if not user_id:
-                st.error("유저 ID를 찾을 수 없습니다.")
-            else:
-                refresh_sec = st.slider("폴링 주기(초)", 20, 120, 45, step=5)
-                st_autorefresh(interval=refresh_sec*1000, key=f"poll_{acct_username}")
+# ---- 유튜브 ----
+elif page == "📺 유튜브":
+    st.title("📺 테슬라 유튜버 — 라이브/최신 영상")
 
-                key_sid = f"since_{acct_username}"
-                since_id = st.session_state.get(key_sid)
+    # 1) 채널 목록 편집
+    st.subheader("채널 목록 편집")
+    df_channels = st.session_state.get("yt_channels_df") or pd.DataFrame(DEFAULT_YT_CHANNELS)
+    df_channels = st.data_editor(df_channels, num_rows="dynamic", key="yt_channels_editor")
+    st.session_state["yt_channels_df"] = df_channels
 
-                tweets, new_since = x_fetch_latest_tweets(user_id, since_id=since_id, max_results=5)
-                if new_since and new_since != since_id:
-                    st.session_state[key_sid] = new_since
+    st.markdown("---")
 
-                if not tweets:
-                    st.write("새 트윗이 아직 없습니다.")
+    # 2) 라이브 체크(선택)
+    st.subheader("지금 라이브 중 🔴")
+    refresh_live = st.checkbox("자동 새로고침(초) 설정", value=True)
+    live_interval = st.slider("라이브 체크 주기(초)", 30, 180, 60, step=15, disabled=not refresh_live)
+    if refresh_live:
+        auto_refresh_html(live_interval, key="yt_live_refresh")
+
+    if df_channels.empty:
+        st.info("채널을 추가하세요. 예: channel_id = UC_x5XG1OV2P6uZZ5FSM9TtQ")
+    else:
+        if not YOUTUBE_API_KEY:
+            st.info("YOUTUBE_API_KEY가 없어서 라이브 상태는 API 없이 확인합니다. 각 채널의 `/live` 링크를 눌러 확인하세요.")
+        live_cols = st.columns(3)
+        idx = 0
+        for _, row in df_channels.iterrows():
+            name = str(row.get("채널명","")).strip()
+            cid  = str(row.get("channel_id","")).strip()
+            if not cid: continue
+            # API가 있으면 라이브 검색
+            lives = yt_api_live_videos(cid, max_results=2) if YOUTUBE_API_KEY else []
+            with live_cols[idx % 3]:
+                if lives:
+                    for lv in lives:
+                        st.markdown(f"**{name}** — 🔴 LIVE: [{lv['title']}]({lv['link']})")
+                        yt_embed(lv["video_id"])
                 else:
-                    for t in reversed(tweets):  # 최신이 위로 오도록
-                        created = t.get("created_at", "")[:19].replace("T", " ")
-                        text = _format_tweet_text(t)
-                        url = f"https://twitter.com/{acct_username}/status/{t['id']}"
-                        st.markdown(f"**@{acct_username}** · {created}  \n{text}\n\n[원문 보기]({url})")
-                        st.markdown("---")
+                    st.markdown(f"**{name}** — 현재 라이브 감지 없음")
+                    st.caption(f"[채널 라이브 페이지 바로가기](https://www.youtube.com/channel/{cid}/live)")
+            idx += 1
 
-# ---- 13F (FREE) ----
+    st.markdown("---")
+
+    # 3) 최신 업로드
+    st.subheader("최신 업로드")
+    per_channel = st.slider("채널별 표시 개수", 1, 8, 3)
+    refresh_latest = st.checkbox("최신 영상 자동 새로고침", value=False)
+    if refresh_latest:
+        auto_refresh_html(90, key="yt_latest_refresh")
+
+    if not df_channels.empty:
+        for _, row in df_channels.iterrows():
+            name = str(row.get("채널명","")).strip()
+            cid  = str(row.get("channel_id","")).strip()
+            if not cid: continue
+            st.markdown(f"### {name}")
+            vids = yt_api_latest_videos(cid, max_results=per_channel)
+            if not vids:
+                st.write("영상 정보를 가져오지 못했습니다.")
+                continue
+            cards = st.columns(len(vids))
+            for col, v in zip(cards, vids):
+                with col:
+                    st.markdown(f"**[{v['title']}]({v['link']})**")
+                    if v["video_id"]:
+                        yt_embed(v["video_id"], height=200)
+                    if v.get("published"):
+                        st.caption(v["published"])
+            st.markdown("---")
+
+    st.caption("팁: 채널 ID는 채널 페이지 URL에서 `channel/` 뒤 24자 ID입니다. 커스텀 핸들이면 '채널 정보 > 공유 > 채널 링크'로 실제 ID 확인.")
+
+# ---- 13F (무료)
 elif page == "🏦 지분 변동(13F, 무료)":
     st.title("🏦 기관 보유/변동 — SEC 13F (완전 무료)")
-    st.caption("분기 공시(13F-HR) 원문을 SEC EDGAR에서 파싱, 최신/직전 분기를 비교해 TSLA 보유 변화 계산")
-
     with st.expander("대상 기관(편집 가능)"):
-        edit_df = pd.DataFrame([{"기관/펀드": k, "CIK": v} for k, v in DEFAULT_CIKS.items()])
+        edit_df = pd.DataFrame([{"기관/펀드": k, "CIK": v} for k,v in DEFAULT_CIKS.items()])
         edited = st.data_editor(edit_df, num_rows="dynamic", key="mgr_edit")
         managers = {row["기관/펀드"]: str(row["CIK"]) for _, row in edited.iterrows()
                     if row.get("기관/펀드") and row.get("CIK")}
-        st.caption("추가/삭제 후 아래 표는 새로고침 시 반영됩니다.")
-
-    refresh = st.button("13F 새로 고침", type="primary")
-    if refresh:
+    if st.button("13F 새로 고침", type="primary"):
         st.cache_data.clear()
-
     with st.spinner("SEC에서 13F 불러오는 중..."):
         df = build_13f_table(managers)
-
     if df.empty:
-        st.warning("데이터를 가져오지 못했습니다. CIK가 맞는지 확인하거나 잠시 후 재시도하세요.")
+        st.warning("데이터를 가져오지 못했습니다.")
     else:
         fmt = df.copy()
         if "보유주수(최근)" in fmt:
@@ -498,15 +639,13 @@ elif page == "🏦 지분 변동(13F, 무료)":
         if "보유주수 증감(qoq)" in fmt:
             fmt["보유주수 증감(qoq)"] = fmt["보유주수 증감(qoq)"].map(lambda x: f"{x:+,}" if pd.notna(x) else "")
         st.dataframe(fmt, use_container_width=True)
+    st.info("참고: 13F는 분기 단위 공개이며, 일중 변동은 제공되지 않습니다.")
 
-    st.info("참고: 13F는 **분기 단위** 공개이며, 일중·일일 변동을 실시간으로 제공하지 않습니다.")
-
-# ---- Settings ----
+# ---- 설정
 elif page == "⚙️ 옵션/설정":
     st.title("⚙️ 옵션/설정")
     st.markdown("""
-    - 본 앱은 **무료 소스**(Yahoo Finance, RSS, SEC EDGAR)를 기본으로 사용합니다.
-    - 더 나은 실시간 시세가 필요하면 Alpha Vantage(무료 키), Polygon/IEX/Finnhub(유료/무료 혼합)를 고려하세요.
-    - SEC 요청은 User-Agent에 **연락 가능한 이메일** 표기를 권장합니다. `your-email@example.com`을 본인 주소로 바꾸세요.
-    - X API 폴링은 선택 기능입니다. `.streamlit/secrets.toml`에 `X_BEARER_TOKEN`을 넣으면 활성화됩니다.
+    - 유튜브: **API 키 없이도** 최신 영상은 RSS로 표시됩니다. 라이브 감지는 **YOUTUBE_API_KEY**가 있을 때 자동화됩니다.
+    - SEC: User-Agent에 **연락 가능한 이메일** 표기를 권장합니다.
+    - X API 폴링을 쓰면 X_BEARER_TOKEN이 필요합니다(없어도 임베드는 동작).
     """)
